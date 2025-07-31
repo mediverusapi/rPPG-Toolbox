@@ -5,7 +5,8 @@ FROM python:3.10-slim AS base
 
 # Prevents Python from writing .pyc files & buffering stdout
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    LOG_LEVEL=DEBUG
 
 # Install OS packages needed by opencv-python wheels and numpy compilation
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -18,8 +19,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config \
         && rm -rf /var/lib/apt/lists/*
 
-# Set work dir
+# Set work dir and create necessary directories
 WORKDIR /app
+RUN mkdir -p /app/temp
 
 # Upgrade pip to latest version
 RUN pip install --upgrade pip
@@ -36,8 +38,16 @@ FROM base AS final
 WORKDIR /app
 COPY . .
 
+# Create a non-root user
+RUN useradd -m appuser && \
+    chown -R appuser:appuser /app && \
+    chmod -R 755 /app
+
+# Switch to non-root user
+USER appuser
+
 EXPOSE 8000
 
-# Gunicorn isn't needed; Uvicorn is fine for a single-process container.
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+# Use a more robust command with proper logging and worker configuration
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--log-level", "debug", "--workers", "1", "--timeout-keep-alive", "1200"]
     
