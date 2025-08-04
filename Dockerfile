@@ -46,8 +46,11 @@ RUN useradd -m appuser && \
 # Switch to non-root user
 USER appuser
 
-EXPOSE 8000
+ENV PORT=8000
 
-# Use a more robust command with proper logging and worker configuration
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--log-level", "debug", "--workers", "1", "--timeout-keep-alive", "1200"]
+# Expose the port (App Runner detects via EXPOSE or env var)
+EXPOSE $PORT
+
+# Start the server, honoring AWS_APP_PORT/PORT if provided
+CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000} --log-level debug --workers 1 --timeout-keep-alive 1200"]
     

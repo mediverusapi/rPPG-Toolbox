@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import os
 import tempfile
-from typing import List
+import importlib.util
+from typing import List, Union, Optional
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, HTTPException, UploadFile
+import torch
+from fastapi import FastAPI, HTTPException, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from scipy import signal
 
@@ -27,17 +29,128 @@ from unsupervised_methods.methods.POS_WANG import POS_WANG  # noqa: E402
 # ---------------------------------------------------------------------
 app = FastAPI(title="rPPG POS Demo")
 
+# ---------------------------------------------------------------------
+# Basic health-check route for container orchestration (AWS App Runner etc.)
+# ---------------------------------------------------------------------
+
+
+@app.get("/")
+async def health():
+    """Return 200 OK with simple JSON body so health checks pass."""
+    return {"status": "ok"}
+
+
+@app.options("/{full_path:path}")
+async def options_handler(full_path: str):
+    """Handle preflight OPTIONS requests for CORS."""
+    return {"status": "ok"}
+
+
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
+    allow_origins=[
+        "https://circadify.com",
+        "http://localhost:3000",  # For local development
+        "http://localhost:8000",  # For local testing
+    ],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
 )
 
 FPS = 30        # expected camera frame-rate
 MIN_SEC = 10    # minimum clip length for a reliable HR estimate
+
+# ---------------------------------------------------------------------
+# Optional Blood-Pressure (BP) predictor setup
+# ---------------------------------------------------------------------
+
+_BP_PREDICTOR = None  # Will stay None if any import / load step fails
+
+try:
+    # Import the model directly
+    import sys
+    sys.path.append(os.path.join(os.path.dirname(__file__), "ppg_bp"))
+    from model import M5_fusion_transformer
+    
+    BP_MODEL_PATH = os.getenv(
+        "BP_MODEL_PATH",
+        os.path.join(os.path.dirname(__file__), "ppg_bp", "output", "ppg2bp_custom.pth"),
+    )
+    
+    print(f"DEBUG: Looking for BP model at: {BP_MODEL_PATH}")
+    if os.path.exists(BP_MODEL_PATH):
+        print("DEBUG: Model file found, initializing predictor...")
+        
+        # Load model directly
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        _BP_MODEL = M5_fusion_transformer(n_input=1, n_output=2)
+        _BP_MODEL.load_state_dict(torch.load(BP_MODEL_PATH, map_location=device))
+        _BP_MODEL.eval()
+        
+        # Load normalization parameters
+        norm_path = os.path.join(os.path.dirname(BP_MODEL_PATH), "bp_norm_params.npy")
+        if os.path.exists(norm_path):
+            _BP_NORM = np.load(norm_path, allow_pickle=True).item()
+        else:
+            _BP_NORM = {'sbp_min': 80, 'sbp_max': 200, 'dbp_min': 40, 'dbp_max': 120}
+        
+        _BP_PREDICTOR = True  # Flag that BP prediction is available
+        print("DEBUG: ✓ BP predictor loaded successfully!")
+    else:
+        print(f"DEBUG: ✗ Model file not found at {BP_MODEL_PATH}")
+        
+except Exception as _bp_exc:  # noqa: BLE001
+    print(f"DEBUG: ✗ BP predictor failed to load: {_bp_exc}")
+    _BP_PREDICTOR = None
+
+
+def _bp_from_ppg(ppg: np.ndarray, age: Optional[float] = None, bmi: Optional[float] = None) -> Optional[dict]:  # noqa: D401
+    """Return systolic/diastolic BP estimate from PPG signal if predictor loaded."""
+    if _BP_PREDICTOR is None:
+        return None
+
+    age_val = age if age is not None else 65.0  # default values if not provided
+    bmi_val = bmi if bmi is not None else 25.0
+
+    try:
+        # Ensure we have at least 512 samples
+        if len(ppg) < 512:
+            ppg = np.pad(ppg, (0, 512 - len(ppg)), mode='constant')
+        elif len(ppg) > 512:
+            ppg = ppg[:512]
+        
+        # Normalize PPG signal (min-max normalization)
+        ppg_min, ppg_max = ppg.min(), ppg.max()
+        if ppg_max > ppg_min:
+            ppg_norm = (ppg - ppg_min) / (ppg_max - ppg_min)
+        else:
+            ppg_norm = ppg * 0
+        
+        with torch.no_grad():
+            # Convert to tensors
+            ppg_tensor = torch.tensor(ppg_norm).float().unsqueeze(0).unsqueeze(0)  # (1, 1, 512)
+            
+            # Age and BMI need to be broadcast to temporal dimension (128 after pooling)
+            age_tensor = torch.tensor([[age_val]]).float().unsqueeze(2).repeat(1, 1, 128)  # (1, 1, 128)
+            bmi_tensor = torch.tensor([[bmi_val]]).float().unsqueeze(2).repeat(1, 1, 128)  # (1, 1, 128)
+            
+            # Predict
+            output = _BP_MODEL(ppg_tensor, age_tensor, bmi_tensor).squeeze()
+            
+            # Denormalize predictions
+            sbp_norm, dbp_norm = output[0].item(), output[1].item()
+            
+            systolic = sbp_norm * (_BP_NORM['sbp_max'] - _BP_NORM['sbp_min']) + _BP_NORM['sbp_min']
+            diastolic = dbp_norm * (_BP_NORM['dbp_max'] - _BP_NORM['dbp_min']) + _BP_NORM['dbp_min']
+            
+            return {
+                "systolic_mmHg": round(max(60, min(250, systolic)), 1),  # Clamp to reasonable range
+                "diastolic_mmHg": round(max(30, min(150, diastolic)), 1),
+            }
+    except Exception:  # noqa: BLE001
+        return None
 
 
 # ---------------------------------------------------------------------
@@ -161,7 +274,11 @@ def _quality_snr(bvp: np.ndarray) -> float:
 
 # ---------------------------------------------------------------------
 @app.post("/predict")
-async def predict_vitals(video: UploadFile):
+async def predict_vitals(
+    video: UploadFile,
+    age: Optional[float] = Form(None),
+    bmi: Optional[float] = Form(None),
+):
     """
     Accept an MP4 clip, run POS_WANG, return comprehensive vital signs.
     """
@@ -188,27 +305,33 @@ async def predict_vitals(video: UploadFile):
     snr = _calculate_snr(bvp, hr_fft, FPS)
     quality = _quality_snr(bvp)
 
-    return {
+    # Optional BP estimation
+    bp_res = _bp_from_ppg(bvp, age, bmi)
+
+    response = {
         "heart_rate": {
             "fft_bpm": round(hr_fft, 1),
             "peak_bpm": round(hr_peak, 1),
-            "method": "Both FFT and peak detection"
+            "method": "Both FFT and peak detection",
         },
         "respiratory_rate": {
-            "breaths_per_minute": round(respiratory_rate, 1)
+            "breaths_per_minute": round(respiratory_rate, 1),
         },
         "heart_rate_variability": {
             "rmssd_ms": round(hrv_metrics["rmssd"], 2),
             "sdnn_ms": round(hrv_metrics["sdnn"], 2),
-            "mean_rr_ms": round(hrv_metrics["mean_rr"], 2)
+            "mean_rr_ms": round(hrv_metrics["mean_rr"], 2),
         },
         "signal_quality": {
             "snr_db": round(snr, 2),
-            "quality_score": round(quality, 3)
+            "quality_score": round(quality, 3),
         },
-        "raw_data": {
-            "bvp_waveform": bvp.tolist(),
-            "sample_rate": FPS,
-            "duration_seconds": len(bvp) / FPS
-        }
     }
+
+    if bp_res is not None:
+        response["blood_pressure"] = bp_res
+    else:
+        # Add debug info when BP prediction fails
+        response["blood_pressure_status"] = "BP predictor not available" if _BP_PREDICTOR is None else "BP prediction failed"
+
+    return response
