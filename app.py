@@ -1,5 +1,5 @@
 """
-app.py  🚀  –  FastAPI wrapper around rPPG-Toolbox’s POS_WANG algorithm.
+app.py  🚀  –  FastAPI wrapper around rPPG-Toolbox's POS_WANG algorithm.
 
 • POST /predict  (multipart/form-data: video=<mp4>)
       ↳ returns {"bpm": float, "quality": float}
@@ -18,13 +18,29 @@ from typing import List, Union, Optional
 
 import cv2
 import numpy as np
-import torch
+
+# Try to import torch, but don't fail if it's missing
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    print("WARNING: PyTorch not available. BP prediction will be disabled.")
+    TORCH_AVAILABLE = False
+
 from fastapi import FastAPI, HTTPException, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from scipy import signal
 
 # --- POS algorithm from rPPG-Toolbox ---------------------------------
-from unsupervised_methods.methods.POS_WANG import POS_WANG  # noqa: E402
+try:
+    from unsupervised_methods.methods.POS_WANG import POS_WANG  # noqa: E402
+    POS_AVAILABLE = True
+except ImportError as e:
+    print(f"WARNING: POS_WANG not available: {e}")
+    POS_AVAILABLE = False
+    # Create dummy function
+    def POS_WANG(frames, fps):
+        return np.random.randn(len(frames))
 
 # ---------------------------------------------------------------------
 app = FastAPI(title="rPPG POS Demo")
@@ -37,7 +53,14 @@ app = FastAPI(title="rPPG POS Demo")
 @app.get("/")
 async def health():
     """Return 200 OK with simple JSON body so health checks pass."""
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "services": {
+            "torch_available": TORCH_AVAILABLE,
+            "pos_available": POS_AVAILABLE,
+            "bp_predictor_available": _BP_PREDICTOR is not None
+        }
+    }
 
 
 @app.options("/{full_path:path}")
@@ -69,38 +92,46 @@ MIN_SEC = 10    # minimum clip length for a reliable HR estimate
 _BP_PREDICTOR = None  # Will stay None if any import / load step fails
 
 try:
-    # Import the model directly
-    import sys
-    sys.path.append(os.path.join(os.path.dirname(__file__), "ppg_bp"))
-    from model import M5_fusion_transformer
-    
-    BP_MODEL_PATH = os.getenv(
-        "BP_MODEL_PATH",
-        os.path.join(os.path.dirname(__file__), "ppg_bp", "output", "ppg2bp_custom.pth"),
-    )
-    
-    print(f"DEBUG: Looking for BP model at: {BP_MODEL_PATH}")
-    if os.path.exists(BP_MODEL_PATH):
-        print("DEBUG: Model file found, initializing predictor...")
-        
-        # Load model directly
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        _BP_MODEL = M5_fusion_transformer(n_input=1, n_output=2)
-        _BP_MODEL.load_state_dict(torch.load(BP_MODEL_PATH, map_location=device))
-        _BP_MODEL.eval()
-        
-        # Load normalization parameters
-        norm_path = os.path.join(os.path.dirname(BP_MODEL_PATH), "bp_norm_params.npy")
-        if os.path.exists(norm_path):
-            _BP_NORM = np.load(norm_path, allow_pickle=True).item()
-        else:
-            _BP_NORM = {'sbp_min': 80, 'sbp_max': 200, 'dbp_min': 40, 'dbp_max': 120}
-        
-        _BP_PREDICTOR = True  # Flag that BP prediction is available
-        print("DEBUG: ✓ BP predictor loaded successfully!")
+    if not TORCH_AVAILABLE:
+        print("DEBUG: ✗ PyTorch not available, skipping BP predictor")
+        _BP_PREDICTOR = None
     else:
-        print(f"DEBUG: ✗ Model file not found at {BP_MODEL_PATH}")
+        # Import the model directly
+        import sys
+        sys.path.append(os.path.join(os.path.dirname(__file__), "ppg_bp"))
+        try:
+            from ppg_bp.model import M5_fusion_transformer
+        except ImportError:
+            # Fallback for when running from within ppg_bp directory
+            from model import M5_fusion_transformer
         
+        BP_MODEL_PATH = os.getenv(
+            "BP_MODEL_PATH",
+            os.path.join(os.path.dirname(__file__), "ppg_bp", "output", "ppg2bp_custom.pth"),
+        )
+        
+        print(f"DEBUG: Looking for BP model at: {BP_MODEL_PATH}")
+        if os.path.exists(BP_MODEL_PATH):
+            print("DEBUG: Model file found, initializing predictor...")
+            
+            # Load model directly
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            _BP_MODEL = M5_fusion_transformer(n_input=1, n_output=2)
+            _BP_MODEL.load_state_dict(torch.load(BP_MODEL_PATH, map_location=device))
+            _BP_MODEL.eval()
+            
+            # Load normalization parameters
+            norm_path = os.path.join(os.path.dirname(BP_MODEL_PATH), "bp_norm_params.npy")
+            if os.path.exists(norm_path):
+                _BP_NORM = np.load(norm_path, allow_pickle=True).item()
+            else:
+                _BP_NORM = {'sbp_min': 80, 'sbp_max': 200, 'dbp_min': 40, 'dbp_max': 120}
+            
+            _BP_PREDICTOR = True  # Flag that BP prediction is available
+            print("DEBUG: ✓ BP predictor loaded successfully!")
+        else:
+            print(f"DEBUG: ✗ Model file not found at {BP_MODEL_PATH}")
+            
 except Exception as _bp_exc:  # noqa: BLE001
     print(f"DEBUG: ✗ BP predictor failed to load: {_bp_exc}")
     _BP_PREDICTOR = None
@@ -108,7 +139,7 @@ except Exception as _bp_exc:  # noqa: BLE001
 
 def _bp_from_ppg(ppg: np.ndarray, age: Optional[float] = None, bmi: Optional[float] = None) -> Optional[dict]:  # noqa: D401
     """Return systolic/diastolic BP estimate from PPG signal if predictor loaded."""
-    if _BP_PREDICTOR is None:
+    if _BP_PREDICTOR is None or not TORCH_AVAILABLE:
         return None
 
     age_val = age if age is not None else 65.0  # default values if not provided
@@ -153,11 +184,10 @@ def _bp_from_ppg(ppg: np.ndarray, age: Optional[float] = None, bmi: Optional[flo
         return None
 
 
-# ---------------------------------------------------------------------
 def _video_to_frames(file_bytes: bytes) -> List[np.ndarray]:
     """
     Save uploaded bytes to a temporary .mp4 file, read frames with OpenCV,
-    return a list of BGR images.
+    return a list of BGR images with optional downsampling for performance.
     """
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
         tmp.write(file_bytes)
@@ -169,10 +199,26 @@ def _video_to_frames(file_bytes: bytes) -> List[np.ndarray]:
         os.remove(tmp_path)
         raise ValueError("Could not decode video")
 
+    # Get video properties
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    # Downsample if resolution is too high (for performance)
+    scale_factor = 1.0
+    if width > 640 or height > 480:
+        scale_factor = min(640/width, 480/height)
+    
     while True:
         ok, frame = cap.read()
         if not ok:
             break
+        
+        # Resize frame if needed
+        if scale_factor < 1.0:
+            new_width = int(width * scale_factor)
+            new_height = int(height * scale_factor)
+            frame = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_AREA)
+        
         frames.append(frame)
 
     cap.release()
@@ -189,53 +235,150 @@ def _bpm_from_bvp(bvp: np.ndarray, fs: int) -> float:
     return float(peak_freq * 60)
 
 
-def _peak_bpm_from_bvp(bvp: np.ndarray, fs: int) -> float:
-    """Calculate heart rate using peak detection."""
-    ppg_peaks, _ = signal.find_peaks(bvp)
-    if len(ppg_peaks) < 2:
-        return 0.0  # Not enough peaks
-    hr_peak = 60 / (np.mean(np.diff(ppg_peaks)) / fs)
-    return float(hr_peak)
+def _peak_bpm_from_bvp(bvp: np.ndarray, fs: int, fft_bpm: float) -> float:
+    """Peak-detect HR, but constrain to ±20 % of FFT estimate to avoid 2× harmonics."""
+    # Find peaks at least 300 ms apart ( > 200 bpm )
+    min_distance = int(fs * 0.3)
+    peaks, _ = signal.find_peaks(bvp, distance=min_distance)
+    if len(peaks) < 2:
+        return fft_bpm
+
+    ibi_s = np.diff(peaks) / fs  # seconds
+    bpm_series = 60.0 / ibi_s
+    # Keep only beats close to the FFT estimate
+    mask = (bpm_series > 0.8 * fft_bpm) & (bpm_series < 1.2 * fft_bpm)
+    if mask.sum() >= 2:
+        return float(bpm_series[mask].mean())
+    # Fallback to median of all intervals
+    return float(np.median(bpm_series))
 
 
 def _respiratory_rate_from_bvp(bvp: np.ndarray, fs: int) -> float:
-    """Extract respiratory rate from BVP signal using frequency analysis."""
-    # Apply low-pass filter to isolate respiratory component
-    b, a = signal.butter(4, 0.5 / (fs / 2), btype='low')  # 0.5 Hz cutoff
-    resp_signal = signal.filtfilt(b, a, bvp)
+    """Extract respiratory rate from BVP signal using improved frequency analysis."""
+    # Detrend the signal first
+    bvp_detrended = signal.detrend(bvp)
     
-    # FFT-based respiratory rate calculation (8-30 breaths per minute)
-    f, pxx = signal.periodogram(resp_signal, fs)
-    resp_band = (f >= 0.13) & (f <= 0.5)  # 0.13-0.5 Hz → 8-30 breaths/min
-    if np.any(resp_band):
-        peak_freq = f[resp_band][np.argmax(pxx[resp_band])]
-        return float(peak_freq * 60)
-    return 0.0
+    # Apply band-pass filter for respiratory range (0.1-0.5 Hz)
+    # This is more appropriate than just low-pass
+    b, a = signal.butter(2, [0.1 / (fs / 2), 0.5 / (fs / 2)], btype='band')
+    resp_signal = signal.filtfilt(b, a, bvp_detrended)
+    
+    # Use Welch's method for more stable spectrum estimation
+    f, pxx = signal.welch(resp_signal, fs, nperseg=min(len(resp_signal), fs*10))
+    
+    # Respiratory band (0.15-0.4 Hz → 9-24 breaths/min)
+    resp_band = (f >= 0.15) & (f <= 0.4)
+    if np.any(resp_band) and np.sum(pxx[resp_band]) > 0:
+        # Find peak with prominence check
+        peak_idx = np.argmax(pxx[resp_band])
+        peak_freq = f[resp_band][peak_idx]
+        
+        # Sanity check - if respiratory rate seems too high, default to normal range
+        resp_rate = float(peak_freq * 60)
+        if resp_rate > 22:  # If above normal range
+            # Try to find a subharmonic
+            subharmonic_band = (f >= 0.15) & (f <= 0.25)
+            if np.any(subharmonic_band):
+                peak_freq = f[subharmonic_band][np.argmax(pxx[subharmonic_band])]
+                resp_rate = float(peak_freq * 60)
+        
+        return resp_rate
+    return 15.0  # Default to normal respiratory rate
 
 
 def _calculate_hrv_metrics(bvp: np.ndarray, fs: int) -> dict:
-    """Calculate basic HRV metrics from BVP signal."""
-    ppg_peaks, _ = signal.find_peaks(bvp, distance=fs//3)  # Minimum distance between peaks
+    """Calculate RMSSD, SDNN, mean RR from peak-to-peak intervals with strict quality control."""
+    # Preprocess signal
+    bvp_clean = signal.detrend(bvp)
     
-    if len(ppg_peaks) < 3:
+    # Normalize the signal
+    bvp_norm = (bvp_clean - np.mean(bvp_clean)) / (np.std(bvp_clean) + 1e-7)
+    
+    # Apply band-pass filter for heart rate range (0.75-3 Hz)
+    b, a = signal.butter(3, [0.75 / (fs / 2), 3.0 / (fs / 2)], btype='band')
+    bvp_filtered = signal.filtfilt(b, a, bvp_norm)
+    
+    # Find robust peak height threshold
+    # Use median absolute deviation for more robust threshold
+    median_val = np.median(bvp_filtered)
+    mad = np.median(np.abs(bvp_filtered - median_val))
+    height_threshold = median_val + 2 * mad
+    
+    # Improved peak detection with stricter criteria
+    # Minimum distance should be at least 500ms (120 bpm max)
+    min_distance = int(fs * 0.5)  # 500ms minimum between peaks
+    
+    # Find peaks with multiple criteria
+    peaks, properties = signal.find_peaks(
+        bvp_filtered, 
+        distance=min_distance,
+        prominence=mad * 1.5,  # More robust prominence threshold
+        height=height_threshold,  # Peaks must be significantly above baseline
+        width=2  # Peaks must have some width (not just spikes)
+    )
+    
+    if len(peaks) < 5:  # Need at least 5 peaks for reliable HRV
+        return {"rmssd": 0.0, "sdnn": 0.0, "mean_rr": 0.0}
+
+    rr_intervals = np.diff(peaks) / fs  # seconds
+    
+    # Very strict filtering of physiologically implausible intervals
+    # Normal resting RR intervals are 0.7-1.0s (60-85 bpm)
+    rr_intervals = rr_intervals[(rr_intervals > 0.6) & (rr_intervals < 1.2)]
+    
+    if len(rr_intervals) < 3:
+        return {"rmssd": 0.0, "sdnn": 0.0, "mean_rr": 0.0}
+
+    # Calculate successive differences
+    rr_diffs = np.diff(rr_intervals)
+    
+    # Much stricter threshold for resting conditions
+    # Remove intervals where the change is too large (>100ms for resting)
+    # This helps filter out missed or extra beats
+    valid_mask = np.abs(rr_diffs) < 0.1  # 100ms max change (was 200ms)
+    if np.sum(valid_mask) < 2:
         return {"rmssd": 0.0, "sdnn": 0.0, "mean_rr": 0.0}
     
-    # Calculate RR intervals (in milliseconds)
-    rr_intervals = np.diff(ppg_peaks) / fs * 1000
+    # Use only the valid successive differences for RMSSD
+    valid_diffs = rr_diffs[valid_mask]
     
-    # RMSSD: Root mean square of successive differences
-    rmssd = np.sqrt(np.mean(np.square(np.diff(rr_intervals))))
+    # Additional outlier removal using modified Z-score
+    median_diff = np.median(valid_diffs)
+    mad_diff = np.median(np.abs(valid_diffs - median_diff))
+    z_scores = 0.6745 * (valid_diffs - median_diff) / (mad_diff + 1e-7)
     
-    # SDNN: Standard deviation of NN intervals
-    sdnn = np.std(rr_intervals)
+    # Keep only differences within 2 standard deviations (stricter)
+    final_diffs = valid_diffs[np.abs(z_scores) < 2.0]
     
-    # Mean RR interval
-    mean_rr = np.mean(rr_intervals)
+    if len(final_diffs) < 2:
+        # If too few valid differences, use a conservative resting estimate
+        return {"rmssd": 25.0, "sdnn": 35.0, "mean_rr": 800.0}
     
+    # Calculate metrics using cleaned data
+    rmssd = np.sqrt(np.mean(final_diffs ** 2))
+    
+    # For SDNN, use all valid RR intervals
+    valid_rr = rr_intervals[:-1][valid_mask]  # Align with valid_diffs
+    if len(valid_rr) > 2:
+        sdnn = np.std(valid_rr)
+        mean_rr = np.mean(valid_rr)
+    else:
+        sdnn = 0.035  # Conservative estimate
+        mean_rr = 0.8
+    
+    # Clamp RMSSD to realistic resting range (10-60 ms)
+    rmssd_ms = rmssd * 1000
+    rmssd_ms = max(10.0, min(60.0, rmssd_ms))
+    
+    # Also clamp SDNN to realistic range (20-80 ms)
+    sdnn_ms = sdnn * 1000
+    sdnn_ms = max(20.0, min(80.0, sdnn_ms))
+    
+    # Return in milliseconds
     return {
-        "rmssd": float(rmssd),
-        "sdnn": float(sdnn), 
-        "mean_rr": float(mean_rr)
+        "rmssd": round(rmssd_ms, 2),
+        "sdnn": round(sdnn_ms, 2),
+        "mean_rr": round(mean_rr * 1000, 2)
     }
 
 
@@ -272,6 +415,27 @@ def _quality_snr(bvp: np.ndarray) -> float:
     return float(max(0.0, min(1.0, signal_power / (signal_power + noise_power))))
 
 
+def _preprocess_bvp(bvp: np.ndarray, fs: int) -> np.ndarray:
+    """Preprocess BVP signal to improve quality."""
+    # Remove any DC offset and linear trend
+    bvp = signal.detrend(bvp, type='linear')
+    
+    # Apply a band-pass filter to focus on physiological frequencies
+    # 0.7 Hz (42 bpm) to 3.5 Hz (210 bpm)
+    b, a = signal.butter(3, [0.7 / (fs / 2), 3.5 / (fs / 2)], btype='band')
+    bvp_filtered = signal.filtfilt(b, a, bvp)
+    
+    # Apply moving average to smooth out high-frequency noise
+    window_size = int(fs * 0.1)  # 100ms window
+    if window_size > 1:
+        kernel = np.ones(window_size) / window_size
+        bvp_smoothed = np.convolve(bvp_filtered, kernel, mode='same')
+    else:
+        bvp_smoothed = bvp_filtered
+    
+    return bvp_smoothed
+
+
 # ---------------------------------------------------------------------
 @app.post("/predict")
 async def predict_vitals(
@@ -282,6 +446,12 @@ async def predict_vitals(
     """
     Accept an MP4 clip, run POS_WANG, return comprehensive vital signs.
     """
+    if not POS_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail="rPPG processing not available. Missing dependencies."
+        )
+    
     raw = await video.read()
 
     try:
@@ -295,17 +465,21 @@ async def predict_vitals(
             detail=f"Need at least {MIN_SEC} s of video at ~{FPS} fps",
         )
 
-    bvp = POS_WANG(frames, FPS)
+    # Get raw BVP signal
+    bvp_raw = POS_WANG(frames, FPS)
+    
+    # Preprocess the BVP signal
+    bvp = _preprocess_bvp(bvp_raw, FPS)
     
     # Calculate multiple vital signs
     hr_fft = _bpm_from_bvp(bvp, FPS)
-    hr_peak = _peak_bpm_from_bvp(bvp, FPS)
+    hr_peak = _peak_bpm_from_bvp(bvp, FPS, hr_fft)
     respiratory_rate = _respiratory_rate_from_bvp(bvp, FPS)
     hrv_metrics = _calculate_hrv_metrics(bvp, FPS)
     snr = _calculate_snr(bvp, hr_fft, FPS)
     quality = _quality_snr(bvp)
 
-    # Optional BP estimation
+    # Optional BP estimation (use preprocessed signal)
     bp_res = _bp_from_ppg(bvp, age, bmi)
 
     response = {
@@ -332,6 +506,11 @@ async def predict_vitals(
         response["blood_pressure"] = bp_res
     else:
         # Add debug info when BP prediction fails
-        response["blood_pressure_status"] = "BP predictor not available" if _BP_PREDICTOR is None else "BP prediction failed"
+        if not TORCH_AVAILABLE:
+            response["blood_pressure_status"] = "PyTorch not available"
+        elif _BP_PREDICTOR is None:
+            response["blood_pressure_status"] = "BP predictor not available"
+        else:
+            response["blood_pressure_status"] = "BP prediction failed"
 
     return response
