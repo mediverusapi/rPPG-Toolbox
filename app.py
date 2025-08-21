@@ -318,7 +318,10 @@ def _calculate_hrv_metrics(bvp: np.ndarray, fs: int) -> dict:
     )
     
     if len(peaks) < 5:  # Need at least 5 peaks for reliable HRV
-        return {"rmssd": 0.0, "sdnn": 0.0, "mean_rr": 0.0}
+        return {
+            "rmssd": 0.0, "sdnn": 0.0, "mean_rr": 0.0,
+            "stress_index": 0.0, "pnn50": 0.0, "parasympathetic_tone": 0.0
+        }
 
     rr_intervals = np.diff(peaks) / fs  # seconds
     
@@ -327,7 +330,10 @@ def _calculate_hrv_metrics(bvp: np.ndarray, fs: int) -> dict:
     rr_intervals = rr_intervals[(rr_intervals > 0.6) & (rr_intervals < 1.2)]
     
     if len(rr_intervals) < 3:
-        return {"rmssd": 0.0, "sdnn": 0.0, "mean_rr": 0.0}
+        return {
+            "rmssd": 0.0, "sdnn": 0.0, "mean_rr": 0.0,
+            "stress_index": 0.0, "pnn50": 0.0, "parasympathetic_tone": 0.0
+        }
 
     # Calculate successive differences
     rr_diffs = np.diff(rr_intervals)
@@ -337,7 +343,10 @@ def _calculate_hrv_metrics(bvp: np.ndarray, fs: int) -> dict:
     # This helps filter out missed or extra beats
     valid_mask = np.abs(rr_diffs) < 0.1  # 100ms max change (was 200ms)
     if np.sum(valid_mask) < 2:
-        return {"rmssd": 0.0, "sdnn": 0.0, "mean_rr": 0.0}
+        return {
+            "rmssd": 0.0, "sdnn": 0.0, "mean_rr": 0.0,
+            "stress_index": 0.0, "pnn50": 0.0, "parasympathetic_tone": 0.0
+        }
     
     # Use only the valid successive differences for RMSSD
     valid_diffs = rr_diffs[valid_mask]
@@ -352,7 +361,10 @@ def _calculate_hrv_metrics(bvp: np.ndarray, fs: int) -> dict:
     
     if len(final_diffs) < 2:
         # If too few valid differences, use a conservative resting estimate
-        return {"rmssd": 25.0, "sdnn": 35.0, "mean_rr": 800.0}
+        return {
+            "rmssd": 25.0, "sdnn": 35.0, "mean_rr": 800.0,
+            "stress_index": 8.0, "pnn50": 15.0, "parasympathetic_tone": 50.0
+        }
     
     # Calculate metrics using cleaned data
     rmssd = np.sqrt(np.mean(final_diffs ** 2))
@@ -366,6 +378,70 @@ def _calculate_hrv_metrics(bvp: np.ndarray, fs: int) -> dict:
         sdnn = 0.035  # Conservative estimate
         mean_rr = 0.8
     
+    # Calculate pNN50 (percentage of successive differences > 50ms)
+    pnn50 = np.sum(np.abs(rr_diffs) > 0.05) / len(rr_diffs) * 100 if len(rr_diffs) > 0 else 0.0
+    
+    # Calculate Baevsky Stress Index
+    # Create histogram of RR intervals
+    rr_ms = rr_intervals * 1000  # Convert to milliseconds
+    if len(rr_ms) > 5:
+        # Use adaptive binning based on data range
+        rr_range = np.max(rr_ms) - np.min(rr_ms)
+        bin_width = max(25, rr_range / 10)  # Adaptive bin width
+        hist, bin_edges = np.histogram(rr_ms, bins=np.arange(min(rr_ms), max(rr_ms) + bin_width, bin_width))
+        
+        if np.max(hist) > 0 and len(hist) > 1:
+            # AMo - amplitude of mode (height of histogram peak)
+            amo = np.max(hist) / len(rr_ms) * 100
+            # Mo - mode (most frequent RR interval)
+            mo_idx = np.argmax(hist)
+            mo = (bin_edges[mo_idx] + bin_edges[mo_idx + 1]) / 2 / 1000  # Back to seconds
+            # MxDMn - max RR - min RR
+            mxdmn = np.max(rr_intervals) - np.min(rr_intervals)
+            
+            # Stress Index = AMo / (2 * Mo * MxDMn)
+            if mo > 0.5 and mxdmn > 0.05:  # Reasonable physiological bounds
+                raw_stress = amo / (2 * mo * mxdmn)
+                
+                # Much more conservative scaling for resting conditions
+                # Apply logarithmic scaling to prevent extreme values
+                if raw_stress > 0:
+                    stress_index = 2 + 4 * np.log10(max(1, raw_stress))  # Log scale starting at 2
+                else:
+                    stress_index = 4.0
+                
+                # Conservative clamp for resting conditions (2-10 range)
+                stress_index = min(10.0, max(2.0, stress_index))
+            else:
+                stress_index = 4.0
+        else:
+            stress_index = 4.0
+    else:
+        stress_index = 4.0
+    
+    # Additional check: if HRV metrics suggest relaxation, lower stress index
+    if rmssd > 0.035 and sdnn > 0.04:  # Good HRV values
+        stress_index = min(stress_index, 6.0)
+    
+    # Calculate parasympathetic tone (0-100 scale)
+    # Based on RMSSD, pNN50, and inverse of stress
+    # Higher RMSSD and pNN50 indicate higher parasympathetic activity
+    rmssd_score = min(80, (rmssd * 1000) * 1.5)  # RMSSD contribution (reduced weight)
+    pnn50_score = min(80, pnn50 * 1.5)  # pNN50 contribution
+    stress_score = max(20, 100 - (stress_index * 6))  # Inverse stress contribution
+    
+    # Weighted average with stress having more influence
+    parasympathetic_tone = (rmssd_score * 0.3 + pnn50_score * 0.3 + stress_score * 0.4)
+    
+    # Consistency check: if stress is high, parasympathetic should be lower
+    if stress_index > 8:
+        parasympathetic_tone = min(parasympathetic_tone, 40)
+    elif stress_index > 6:
+        parasympathetic_tone = min(parasympathetic_tone, 60)
+    
+    # Ensure parasympathetic tone is reasonable
+    parasympathetic_tone = max(10.0, min(90.0, parasympathetic_tone))
+    
     # Clamp RMSSD to realistic resting range (10-60 ms)
     rmssd_ms = rmssd * 1000
     rmssd_ms = max(10.0, min(60.0, rmssd_ms))
@@ -378,7 +454,10 @@ def _calculate_hrv_metrics(bvp: np.ndarray, fs: int) -> dict:
     return {
         "rmssd": round(rmssd_ms, 2),
         "sdnn": round(sdnn_ms, 2),
-        "mean_rr": round(mean_rr * 1000, 2)
+        "mean_rr": round(mean_rr * 1000, 2),
+        "stress_index": round(stress_index, 2),
+        "pnn50": round(pnn50, 2),
+        "parasympathetic_tone": round(parasympathetic_tone, 1)
     }
 
 
@@ -434,6 +513,34 @@ def _preprocess_bvp(bvp: np.ndarray, fs: int) -> np.ndarray:
         bvp_smoothed = bvp_filtered
     
     return bvp_smoothed
+
+
+def _get_stress_level(stress_index: float) -> str:
+    """Convert stress index to human-readable level."""
+    if stress_index < 3.5:
+        return "very_low"
+    elif stress_index < 4.5:
+        return "low"
+    elif stress_index < 6.0:
+        return "moderate"
+    elif stress_index < 8.0:
+        return "high"
+    else:
+        return "very_high"
+
+
+def _get_relaxation_state(parasympathetic_tone: float) -> str:
+    """Convert parasympathetic tone to relaxation state."""
+    if parasympathetic_tone >= 70:
+        return "deeply_relaxed"
+    elif parasympathetic_tone >= 50:
+        return "relaxed"
+    elif parasympathetic_tone >= 30:
+        return "neutral"
+    elif parasympathetic_tone >= 20:
+        return "slightly_tense"
+    else:
+        return "tense"
 
 
 # ---------------------------------------------------------------------
@@ -495,6 +602,13 @@ async def predict_vitals(
             "rmssd_ms": round(hrv_metrics["rmssd"], 2),
             "sdnn_ms": round(hrv_metrics["sdnn"], 2),
             "mean_rr_ms": round(hrv_metrics["mean_rr"], 2),
+            "pnn50_percent": round(hrv_metrics["pnn50"], 2),
+        },
+        "stress_and_relaxation": {
+            "stress_index": round(hrv_metrics["stress_index"], 2),
+            "parasympathetic_tone": round(hrv_metrics["parasympathetic_tone"], 1),
+            "stress_level": _get_stress_level(hrv_metrics["stress_index"]),
+            "relaxation_state": _get_relaxation_state(hrv_metrics["parasympathetic_tone"]),
         },
         "signal_quality": {
             "snr_db": round(snr, 2),
