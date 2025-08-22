@@ -14,10 +14,36 @@ from __future__ import annotations
 import os
 import tempfile
 import importlib.util
-from typing import List, Union, Optional
+from typing import List, Union, Optional, Tuple
 
 import cv2
 import numpy as np
+
+# NumPy 2.0 compatibility shim for legacy code expecting np.mat
+try:
+    if not hasattr(np, "mat") and hasattr(np, "asmatrix"):
+        np.mat = np.asmatrix  # type: ignore[attr-defined]
+except Exception:
+    pass
+# Image enhancement tuning (blend strength and gamma). Override via env vars.
+def _get_float_env(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, default))
+    except Exception:
+        return default
+
+SCI_STRENGTH = _get_float_env("SCI_STRENGTH", 0.7)  # 0=original, 1=full SCI
+SCI_GAMMA = _get_float_env("SCI_GAMMA", 1.0)        # >1 darkens, <1 brightens
+
+def _get_bool_env(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.lower() in ("1", "true", "yes", "on")
+
+# Disable face crop by default to avoid mis-crops causing stretching
+FACE_CROP_ENABLED = _get_bool_env("FACE_CROP", False)
+
 
 # Try to import torch, but don't fail if it's missing
 try:
@@ -28,8 +54,47 @@ except ImportError:
     TORCH_AVAILABLE = False
 
 from fastapi import FastAPI, HTTPException, UploadFile, Form
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from scipy import signal
+
+# --- Optional SCI image enhancement (from image_enhancement_model) ---------
+SCI_AVAILABLE = False
+_SCI = None
+_SCI_DEVICE = "cpu"
+try:
+    # Reuse torch availability detected above
+    if TORCH_AVAILABLE:
+        from image_enhancement_model.model import Finetunemodel as _SCIModel  # noqa: E402
+        SCI_AVAILABLE = True
+        # Select device
+        if torch.cuda.is_available():
+            _SCI_DEVICE = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            _SCI_DEVICE = "mps"
+        else:
+            _SCI_DEVICE = "cpu"
+
+        # Load weights if present
+        _SCI_WEIGHTS = os.getenv(
+            "SCI_WEIGHTS_PATH",
+            os.path.join(os.path.dirname(__file__), "image_enhancement_model", "weights", "medium.pt"),
+        )
+        if os.path.exists(_SCI_WEIGHTS):
+            try:
+                _SCI = _SCIModel(_SCI_WEIGHTS).to(_SCI_DEVICE)
+                _SCI.eval()
+                print("DEBUG: ✓ SCI enhancer loaded")
+            except Exception as _sci_exc:  # noqa: BLE001
+                print(f"DEBUG: ✗ SCI enhancer load failed: {_sci_exc}")
+                _SCI = None
+        else:
+            print(f"DEBUG: ✗ SCI weights not found at: {_SCI_WEIGHTS}")
+    else:
+        print("DEBUG: ✗ Torch unavailable, SCI enhancer disabled")
+except Exception as _sci_top_exc:  # noqa: BLE001
+    print(f"DEBUG: ✗ SCI enhancer setup failed: {_sci_top_exc}")
+    _SCI = None
 
 # --- POS algorithm from rPPG-Toolbox ---------------------------------
 try:
@@ -84,6 +149,11 @@ app.add_middleware(
 
 FPS = 30        # expected camera frame-rate
 MIN_SEC = 10    # minimum clip length for a reliable HR estimate
+
+# Directory to save enhanced preview videos
+from uuid import uuid4
+ENH_OUT_DIR = os.path.join(os.path.dirname(__file__), "model_outputs", "enhanced_previews")
+os.makedirs(ENH_OUT_DIR, exist_ok=True)
 
 # ---------------------------------------------------------------------
 # Optional Blood-Pressure (BP) predictor setup
@@ -184,7 +254,7 @@ def _bp_from_ppg(ppg: np.ndarray, age: Optional[float] = None, bmi: Optional[flo
         return None
 
 
-def _video_to_frames(file_bytes: bytes) -> List[np.ndarray]:
+def _video_to_frames(file_bytes: bytes) -> Tuple[List[np.ndarray], float, bool, bool, Optional[str]]:
     """
     Save uploaded bytes to a temporary .mp4 file, read frames with OpenCV,
     return a list of BGR images with optional downsampling for performance.
@@ -194,6 +264,10 @@ def _video_to_frames(file_bytes: bytes) -> List[np.ndarray]:
         tmp_path = tmp.name
 
     frames: List[np.ndarray] = []
+    enhancement_used = False
+    face_crop_used = False
+    preview_path = None
+    writer = None
     cap = cv2.VideoCapture(tmp_path)
     if not cap.isOpened():
         os.remove(tmp_path)
@@ -202,28 +276,122 @@ def _video_to_frames(file_bytes: bytes) -> List[np.ndarray]:
     # Get video properties
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps_read = cap.get(cv2.CAP_PROP_FPS)
+    try:
+        fs = float(fps_read)
+        if fs <= 1e-3 or np.isnan(fs):
+            fs = FPS
+    except Exception:
+        fs = FPS
     
-    # Downsample if resolution is too high (for performance)
+    # Downsample while preserving aspect ratio (long side to 640)
     scale_factor = 1.0
-    if width > 640 or height > 480:
-        scale_factor = min(640/width, 480/height)
+    max_side = max(width, height)
+    if max_side > 640:
+        scale_factor = 640.0 / max_side
+
+    # Prepare face detector (optional)
+    face_detector = None
+    cascade_path = os.path.join(os.path.dirname(__file__), 'dataset', 'haarcascade_frontalface_default.xml')
+    if os.path.exists(cascade_path):
+        try:
+            face_detector = cv2.CascadeClassifier(cascade_path)
+        except Exception:
+            face_detector = None
+    face_box = None
     
+    idx = 0
     while True:
         ok, frame = cap.read()
         if not ok:
             break
-        
+
+        # Simple face detection and crop (detect first frame and reuse)
+        if FACE_CROP_ENABLED and face_detector is not None and (face_box is None or idx % 60 == 0):
+            try:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                faces = face_detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
+                if len(faces) > 0:
+                    # Pick largest face
+                    x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+                    # Make square and slightly larger
+                    side = int(max(w, h) * 1.3)
+                    cx, cy = x + w // 2, y + h // 2
+                    x0 = max(0, cx - side // 2)
+                    y0 = max(0, cy - side // 2)
+                    x1 = min(frame.shape[1], x0 + side)
+                    y1 = min(frame.shape[0], y0 + side)
+                    face_box = (x0, y0, x1, y1)
+                    face_crop_used = True
+            except Exception:
+                pass
+
+        # Apply crop if available
+        if FACE_CROP_ENABLED and face_box is not None:
+            x0, y0, x1, y1 = face_box
+            frame = frame[y0:y1, x0:x1]
+
         # Resize frame if needed
         if scale_factor < 1.0:
             new_width = int(width * scale_factor)
             new_height = int(height * scale_factor)
             frame = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_AREA)
-        
+
+        # Optional SCI enhancement (frame-level)
+        if _SCI is not None:
+            try:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+                tensor = torch.from_numpy(np.transpose(rgb, (2, 0, 1))).unsqueeze(0)
+                tensor = tensor.to(_SCI_DEVICE)
+                with torch.no_grad():
+                    _, r = _SCI(tensor)
+                enh = r[0].detach().cpu().numpy()
+                enh = np.transpose(enh, (1, 2, 0))
+                # Blend strength and optional gamma
+                s = max(0.0, min(1.0, SCI_STRENGTH))
+                out_rgb = (1.0 - s) * rgb + s * enh
+                if abs(SCI_GAMMA - 1.0) > 1e-6:
+                    g = max(0.2, min(5.0, SCI_GAMMA))
+                    out_rgb = np.power(np.clip(out_rgb, 0.0, 1.0), g)
+                enh_u8 = (np.clip(out_rgb, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+                frame = cv2.cvtColor(enh_u8, cv2.COLOR_RGB2BGR)
+                enhancement_used = True
+            except Exception:
+                # Fail open: if enhancement fails, continue with original frame
+                pass
+
+        # Init preview writer lazily with processed frame size
+        if writer is None:
+            out_h, out_w = frame.shape[0], frame.shape[1]
+            fourcc = cv2.VideoWriter_fourcc(*"avc1")
+            from uuid import uuid4
+            preview_name = f"{uuid4().hex}.mp4"
+            from os import path as _p
+            preview_path = _p.join(_p.dirname(__file__), "model_outputs", "enhanced_previews", preview_name)
+            os.makedirs(os.path.dirname(preview_path), exist_ok=True)
+            writer = cv2.VideoWriter(preview_path, fourcc, fs, (out_w, out_h))
+            if not writer.isOpened():
+                for fallback in ["mp4v", "MJPG"]:
+                    fourcc = cv2.VideoWriter_fourcc(*fallback)
+                    writer = cv2.VideoWriter(preview_path, fourcc, fs, (out_w, out_h))
+                    if writer.isOpened():
+                        break
+        if writer is not None and writer.isOpened():
+            writer.write(frame)
+
         frames.append(frame)
+        idx += 1
 
     cap.release()
+    if writer is not None:
+        writer.release()
     os.remove(tmp_path)
-    return frames
+    # Return basename for serving later
+    if preview_path is not None:
+        preview_rel = os.path.relpath(preview_path, os.path.dirname(__file__))
+    else:
+        preview_rel = None
+    return frames, fs, enhancement_used, face_crop_used, preview_rel
 
 
 def _bpm_from_bvp(bvp: np.ndarray, fs: int) -> float:
@@ -500,8 +668,10 @@ def _preprocess_bvp(bvp: np.ndarray, fs: int) -> np.ndarray:
     bvp = signal.detrend(bvp, type='linear')
     
     # Apply a band-pass filter to focus on physiological frequencies
-    # 0.7 Hz (42 bpm) to 3.5 Hz (210 bpm)
-    b, a = signal.butter(3, [0.7 / (fs / 2), 3.5 / (fs / 2)], btype='band')
+    # Slightly tighten band to reduce motion and high-frequency noise
+    low = max(0.75, 0.8)
+    high = min(3.5, 3.2)
+    b, a = signal.butter(3, [low / (fs / 2), high / (fs / 2)], btype='band')
     bvp_filtered = signal.filtfilt(b, a, bvp)
     
     # Apply moving average to smooth out high-frequency noise
@@ -562,7 +732,7 @@ async def predict_vitals(
     raw = await video.read()
 
     try:
-        frames = _video_to_frames(raw)
+        frames, fs_used, enh_used, crop_used, preview_rel = _video_to_frames(raw)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -573,17 +743,18 @@ async def predict_vitals(
         )
 
     # Get raw BVP signal
-    bvp_raw = POS_WANG(frames, FPS)
+    # Use detected FPS when available to improve SNR
+    bvp_raw = POS_WANG(frames, int(fs_used) if fs_used else FPS)
     
     # Preprocess the BVP signal
-    bvp = _preprocess_bvp(bvp_raw, FPS)
+    bvp = _preprocess_bvp(bvp_raw, int(fs_used) if fs_used else FPS)
     
     # Calculate multiple vital signs
-    hr_fft = _bpm_from_bvp(bvp, FPS)
-    hr_peak = _peak_bpm_from_bvp(bvp, FPS, hr_fft)
-    respiratory_rate = _respiratory_rate_from_bvp(bvp, FPS)
-    hrv_metrics = _calculate_hrv_metrics(bvp, FPS)
-    snr = _calculate_snr(bvp, hr_fft, FPS)
+    hr_fft = _bpm_from_bvp(bvp, int(fs_used) if fs_used else FPS)
+    hr_peak = _peak_bpm_from_bvp(bvp, int(fs_used) if fs_used else FPS, hr_fft)
+    respiratory_rate = _respiratory_rate_from_bvp(bvp, int(fs_used) if fs_used else FPS)
+    hrv_metrics = _calculate_hrv_metrics(bvp, int(fs_used) if fs_used else FPS)
+    snr = _calculate_snr(bvp, hr_fft, int(fs_used) if fs_used else FPS)
     quality = _quality_snr(bvp)
 
     # Optional BP estimation (use preprocessed signal)
@@ -614,6 +785,11 @@ async def predict_vitals(
             "snr_db": round(snr, 2),
             "quality_score": round(quality, 3),
         },
+        "preprocessing": {
+            "image_enhancement": "enabled" if enh_used else "disabled",
+            "fps_used": int(fs_used) if fs_used else FPS,
+            "face_crop": "enabled" if crop_used else "disabled",
+        },
     }
 
     if bp_res is not None:
@@ -627,4 +803,17 @@ async def predict_vitals(
         else:
             response["blood_pressure_status"] = "BP prediction failed"
 
+    # If preview exists, return it as a downloadable attachment along with JSON via headers
+    if preview_rel:
+        preview_abs = os.path.join(os.path.dirname(__file__), preview_rel)
+        # Include path in response; client can download from /preview/{filename}
+        response["preprocessing"]["enhanced_preview"] = f"/preview/{os.path.basename(preview_abs)}"
     return response
+
+
+@app.get("/preview/{filename}")
+async def get_preview(filename: str):
+    file_path = os.path.join(os.path.dirname(__file__), "model_outputs", "enhanced_previews", filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Preview not found")
+    return FileResponse(file_path, media_type="video/mp4", filename=filename)

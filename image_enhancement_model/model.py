@@ -1,6 +1,9 @@
 import torch
 import torch.nn as nn
-from loss import LossFunction
+try:
+    from .loss import LossFunction
+except Exception:
+    from loss import LossFunction
 
 
 
