@@ -46,3 +46,4 @@ logs/
 # IDE
 .vscode/
 .idea/
+._*
