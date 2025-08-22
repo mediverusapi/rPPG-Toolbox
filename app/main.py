@@ -17,6 +17,8 @@ def create_app() -> FastAPI:
             "https://circadify.com",
             "http://localhost:3000",
             "http://localhost:8000",
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
         ],
         allow_credentials=True,
         allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],

@@ -4,7 +4,7 @@ import numpy as np
 from scipy import signal
 import cv2
 
-from ..config import GREEN_EMPHASIS
+from ..config import GREEN_EMPHASIS, HR_MIN_BPM, HR_MAX_BPM, ANCHOR_BW_HZ
 
 
 def preprocess_bvp(bvp: np.ndarray, fs: int) -> np.ndarray:
@@ -15,12 +15,38 @@ def preprocess_bvp(bvp: np.ndarray, fs: int) -> np.ndarray:
         bvp = signal.medfilt(bvp, kernel_size=k)
     except Exception:
         pass
-    # Revert to slightly tighter passband but allow lower HR down to 0.8 Hz
-    low, high = 0.8, 2.8
+    # Use a slightly narrower passband around typical HR to improve SNR
+    low, high = 0.9, 2.5
     b, a = signal.butter(3, [low / (fs / 2), high / (fs / 2)], btype='band')
     bvp_filtered = signal.filtfilt(b, a, bvp)
     # Slightly stronger smoothing after band-pass (cap to avoid over-smoothing)
-    window_size = int(min(fs * 0.2, 15))
+    window_size = int(min(fs * 0.15, 11))
+    if window_size > 1:
+        kernel = np.ones(window_size) / window_size
+        return np.convolve(bvp_filtered, kernel, mode='same')
+    return bvp_filtered
+
+
+def preprocess_bvp_anchored(bvp: np.ndarray, fs: int, hr_bpm: float) -> np.ndarray:
+    """Band-pass BVP around an HR anchor to improve SNR.
+    Uses a narrow band centered at HR (default ±0.35 Hz), clipped to physio range.
+    """
+    bvp = signal.detrend(bvp, type='linear')
+    # Constrain anchor to plausible range
+    hr_bpm = float(hr_bpm) if hr_bpm and np.isfinite(hr_bpm) else 72.0
+    hr_bpm = float(min(max(hr_bpm, HR_MIN_BPM), HR_MAX_BPM))
+    hr_hz = hr_bpm / 60.0
+    bw = float(ANCHOR_BW_HZ)
+    low = max(0.7, hr_hz - bw)
+    high = min(3.0, hr_hz + bw)
+    if high - low < 0.2:
+        pad = (0.2 - (high - low)) / 2
+        low = max(0.7, low - pad)
+        high = min(3.0, high + pad)
+    b, a = signal.butter(3, [low / (fs / 2), high / (fs / 2)], btype='band')
+    bvp_filtered = signal.filtfilt(b, a, bvp)
+    # light smoothing
+    window_size = int(min(fs * 0.10, 9))
     if window_size > 1:
         kernel = np.ones(window_size) / window_size
         return np.convolve(bvp_filtered, kernel, mode='same')
@@ -56,24 +82,100 @@ def emphasize_green_mean_rgb(frames: list[np.ndarray]) -> np.ndarray:
 
 
 def bpm_fft(bvp: np.ndarray, fs: int) -> float:
-    bvp = bvp - np.mean(bvp)
-    f, pxx = signal.periodogram(bvp, fs)
-    band = (f >= 0.75) & (f <= 3.0)
-    peak_freq = f[band][np.argmax(pxx[band])] if np.any(band) else 1.0
-    return float(peak_freq * 60)
+    """HR from spectrum with harmonic/subharmonic resolution.
+    - Finds dominant peak within [HR_MIN_BPM, HR_MAX_BPM].
+    - If peak near 2x a plausible rate, fold to fundamental.
+    - If near 0.5x, double to plausible.
+    """
+    b = bvp - np.mean(bvp)
+    f, pxx = signal.welch(b, fs, nperseg=min(len(b), max(256, 8*fs)))
+    band = (f * 60 >= HR_MIN_BPM) & (f * 60 <= HR_MAX_BPM)
+    if not np.any(band):
+        return 72.0
+    fb = f[band]
+    pb = pxx[band]
+    peak_idx = int(np.argmax(pb))
+    peak_hz = float(fb[peak_idx])
+    peak_bpm = peak_hz * 60.0
+    # harmonic handling
+    # check subharmonic at half frequency within band
+    half_bpm = peak_bpm / 2.0
+    if HR_MIN_BPM <= half_bpm <= HR_MAX_BPM:
+        # compare energy around half vs at peak
+        bw = 0.1
+        def _band_power(center_hz: float):
+            m = (f >= max(0.0, center_hz - bw)) & (f <= center_hz + bw)
+            return float(np.sum(pxx[m]))
+        if _band_power(peak_hz/2.0) * 1.2 > _band_power(peak_hz):
+            peak_bpm = half_bpm
+    # avoid subharmonic underestimates
+    if peak_bpm < HR_MIN_BPM:
+        peak_bpm *= 2.0
+    if peak_bpm > HR_MAX_BPM:
+        peak_bpm /= 2.0
+    return float(min(max(peak_bpm, HR_MIN_BPM), HR_MAX_BPM))
 
 
 def bpm_peaks(bvp: np.ndarray, fs: int, fft_bpm: float) -> float:
-    min_distance = int(fs * 0.3)
+    min_distance = int(fs * 0.4)
     peaks, _ = signal.find_peaks(bvp, distance=min_distance)
     if len(peaks) < 2:
         return fft_bpm
     ibi_s = np.diff(peaks) / fs
     bpm_series = 60.0 / ibi_s
-    mask = (bpm_series > 0.8 * fft_bpm) & (bpm_series < 1.2 * fft_bpm)
+    # only accept beats close to constrained FFT HR
+    fft_bpm_c = float(min(max(fft_bpm, HR_MIN_BPM), HR_MAX_BPM))
+    mask = (bpm_series > 0.8 * fft_bpm_c) & (bpm_series < 1.2 * fft_bpm_c)
     if mask.sum() >= 2:
         return float(bpm_series[mask].mean())
-    return float(np.median(bpm_series))
+    return float(np.median(bpm_series[(bpm_series>=HR_MIN_BPM) & (bpm_series<=HR_MAX_BPM)]))
+
+
+def bpm_autocorr(bvp: np.ndarray, fs: int) -> float:
+    """Estimate HR from autocorrelation peak within [HR_MIN_BPM, HR_MAX_BPM]."""
+    x = bvp - np.mean(bvp)
+    # normalized autocorrelation (biased is fine for peak location)
+    ac = signal.correlate(x, x, mode='full')
+    ac = ac[ac.size // 2:]
+    # Convert HR limits to lag indices
+    min_lag = int(fs * 60.0 / HR_MAX_BPM)
+    max_lag = int(fs * 60.0 / HR_MIN_BPM)
+    min_lag = max(min_lag, 1)
+    max_lag = min(max_lag, len(ac) - 1)
+    if max_lag <= min_lag + 1:
+        return float((HR_MIN_BPM + HR_MAX_BPM) / 2.0)
+    roi = ac[min_lag:max_lag]
+    if roi.size < 3:
+        return float((HR_MIN_BPM + HR_MAX_BPM) / 2.0)
+    peaks, _ = signal.find_peaks(roi)
+    if len(peaks) == 0:
+        lag = int(np.argmax(roi)) + min_lag
+    else:
+        lag = int(peaks[np.argmax(roi[peaks])]) + min_lag
+    bpm = 60.0 * fs / float(max(lag, 1))
+    return float(min(max(bpm, HR_MIN_BPM), HR_MAX_BPM))
+
+
+def refine_hr_harmonic(bvp: np.ndarray, fs: int, hr_guess_bpm: float) -> float:
+    """Refine HR by checking subharmonic and harmonic power around the guess.
+    Picks among {hr, hr/2, hr*2} staying within limits, favoring strongest power.
+    """
+    hr_guess_bpm = float(min(max(hr_guess_bpm, HR_MIN_BPM), HR_MAX_BPM))
+    b = bvp - np.mean(bvp)
+    f, pxx = signal.welch(b, fs, nperseg=min(len(b), max(256, 8*fs)))
+    def band_power(target_bpm: float) -> float:
+        hz = target_bpm / 60.0
+        w = 0.08
+        m = (f >= max(0.0, hz - w)) & (f <= hz + w)
+        return float(np.sum(pxx[m]))
+    cands = []
+    for v in [hr_guess_bpm, hr_guess_bpm / 2.0, hr_guess_bpm * 2.0]:
+        if HR_MIN_BPM <= v <= HR_MAX_BPM:
+            cands.append((v, band_power(v)))
+    if not cands:
+        return hr_guess_bpm
+    best = max(cands, key=lambda t: t[1])[0]
+    return float(best)
 
 
 def respiratory_rate(bvp: np.ndarray, fs: int) -> float:
@@ -191,7 +293,7 @@ def snr_db(bvp: np.ndarray, hr_bpm: float, fs: int) -> float:
     hr_band = (f >= (hr_freq - deviation)) & (f <= (hr_freq + deviation))
     harmonic_band = (f >= (2 * hr_freq - deviation)) & (f <= (2 * hr_freq + deviation))
     signal_power = float(np.sum(pxx[hr_band]) + np.sum(pxx[harmonic_band]))
-    phys_band = (f >= 0.8) & (f <= 2.8)
+    phys_band = (f >= 0.75) & (f <= 3.0)
     noise_band = phys_band & ~hr_band & ~harmonic_band
     noise_power = float(np.sum(pxx[noise_band]))
     if noise_power <= 0 or not np.isfinite(noise_power):
@@ -200,8 +302,15 @@ def snr_db(bvp: np.ndarray, hr_bpm: float, fs: int) -> float:
 
 
 def quality_score(bvp: np.ndarray) -> float:
-    signal_power = np.var(signal.detrend(bvp))
-    noise_power = np.var(bvp - signal.detrend(bvp))
-    return float(max(0.0, min(1.0, signal_power / (signal_power + noise_power))))
+    b = signal.detrend(bvp)
+    f, pxx = signal.welch(b, fs=max(30, int(len(bvp) / max(1, len(bvp)//2))), nperseg=min(len(b), 512))
+    band = (f >= 0.8) & (f <= 2.8)
+    if not np.any(band):
+        return 0.0
+    total = float(np.sum(pxx[band]))
+    if total <= 0:
+        return 0.0
+    peak = float(np.max(pxx[band]))
+    return float(max(0.0, min(1.0, peak / total)))
 
 

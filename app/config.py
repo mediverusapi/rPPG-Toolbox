@@ -23,8 +23,8 @@ FPS = 30
 MIN_SEC = 10
 
 
-# Enhancement parameters
-SCI_STRENGTH = _get_float_env("SCI_STRENGTH", 0.5)
+# Enhancement parameters (disabled for neural inference alignment)
+SCI_STRENGTH = _get_float_env("SCI_STRENGTH", 0.0)
 SCI_GAMMA = _get_float_env("SCI_GAMMA", 1.0)
 
 # Face crop toggle (detect once and lock ROI)
@@ -36,9 +36,29 @@ FOREHEAD_ONLY = _get_bool_env("FOREHEAD_ONLY", False)
 # Optional green-channel emphasis (1.0 = off)
 GREEN_EMPHASIS = _get_float_env("GREEN_EMPHASIS", 1.08)
 
-# Face box scale (1.0 = detected box, >1 zooms out, <1 zooms in)
-FACE_BOX_SCALE = _get_float_env("FACE_BOX_SCALE", 0.85)
+# Optional green-trace blend weight into neural output (0.0–0.5)
+GREEN_BLEND = _get_float_env("GREEN_BLEND", 0.12)
 
+# Face box scale (1.0 = detected box, >1 zooms out, <1 zooms in)
+FACE_BOX_SCALE = _get_float_env("FACE_BOX_SCALE", 1.50)
+
+# Neural rPPG toggles
+USE_NEURAL_RPPG = _get_bool_env("USE_NEURAL_RPPG", True)
+RPPG_INFER_CONFIG = os.getenv(
+    "RPPG_INFER_CONFIG",
+    os.path.join(
+        os.path.dirname(os.path.dirname(__file__)),
+        "configs",
+        "infer_configs",
+        "PURE_UBFC-rPPG_PHYSNET_BASIC.yaml",
+    ),
+)
+
+
+# HR constraints and filtering parameters
+HR_MIN_BPM = int(_get_float_env("HR_MIN_BPM", 40.0))
+HR_MAX_BPM = int(_get_float_env("HR_MAX_BPM", 200.0))
+ANCHOR_BW_HZ = _get_float_env("ANCHOR_BW_HZ", 0.30)  # half-width around anchor
 
 # Paths
 ROOT_DIR = os.path.dirname(os.path.dirname(__file__))

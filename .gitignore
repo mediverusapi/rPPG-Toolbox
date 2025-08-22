@@ -39,6 +39,11 @@ image_enhancement_model/results/
 runs/
 logs/
 
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.env.local
+
 # Cache
 *.npy
 *.npz
