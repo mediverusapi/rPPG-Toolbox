@@ -187,16 +187,20 @@ async def predict_vitals(
         fs_eval = int(fs_used) if fs_used else FPS
         min_distance = int(fs_eval * 0.3)
         pks, _ = _sig.find_peaks(bvp, distance=min_distance)
-        fig, ax = plt.subplots(figsize=(10, 3))
+        # Make figure wider and taller for longer signals to spread out peaks
+        duration_s = len(bvp) / fs_eval
+        fig_width = max(12, min(24, duration_s * 1.0))  # scale with duration
+        fig, ax = plt.subplots(figsize=(fig_width, 4))
         t = np.arange(len(bvp)) / fs_eval
         ax.plot(t, bvp - np.mean(bvp), linewidth=1.1)
         if len(pks) > 0:
-            ax.scatter(t[pks], (bvp - np.mean(bvp))[pks], s=10, color='r', alpha=0.8, label='peaks')
+            ax.scatter(t[pks], (bvp - np.mean(bvp))[pks], s=12, color='r', alpha=0.8, label=f'{len(pks)} peaks')
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("Amplitude")
-        ax.set_title("BVP with detected peaks")
+        ax.set_title(f"BVP with detected peaks ({duration_s:.1f}s)")
         if len(pks) > 0:
             ax.legend(loc='upper right')
+        ax.grid(True, alpha=0.3)
         fig.tight_layout()
         buf = io.BytesIO()
         fig.savefig(buf, format="png", dpi=150)

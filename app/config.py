@@ -23,8 +23,9 @@ FPS = 30
 MIN_SEC = 10
 
 
-# Enhancement parameters (disabled for neural inference alignment)
-SCI_STRENGTH = _get_float_env("SCI_STRENGTH", 0.0)
+# Enhancement parameters
+SCI_ENHANCEMENT_ENABLED = _get_bool_env("SCI_ENHANCEMENT_ENABLED", True)
+SCI_STRENGTH = _get_float_env("SCI_STRENGTH", 0.5)
 SCI_GAMMA = _get_float_env("SCI_GAMMA", 1.0)
 
 # Face crop toggle (detect once and lock ROI)
@@ -43,7 +44,7 @@ GREEN_BLEND = _get_float_env("GREEN_BLEND", 0.12)
 FACE_BOX_SCALE = _get_float_env("FACE_BOX_SCALE", 1.50)
 
 # Neural rPPG toggles
-USE_NEURAL_RPPG = _get_bool_env("USE_NEURAL_RPPG", True)
+USE_NEURAL_RPPG = _get_bool_env("USE_NEURAL_RPPG", False)
 RPPG_INFER_CONFIG = os.getenv(
     "RPPG_INFER_CONFIG",
     os.path.join(

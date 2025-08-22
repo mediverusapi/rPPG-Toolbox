@@ -20,7 +20,7 @@ export default function MetricsCard({ data }) {
   return (
     <div className="bg-white border rounded p-4 space-y-3">
       <div className="text-base font-semibold">Metrics</div>
-      <div className="grid md:grid-cols-2 gap-6">
+      <div className="space-y-4">
         <div>
           <div className="font-medium mb-1">Heart Rate</div>
           <Row label="FFT" value={hr.fft_bpm} unit="bpm" />
