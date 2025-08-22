@@ -10,17 +10,17 @@ from ..config import GREEN_EMPHASIS, HR_MIN_BPM, HR_MAX_BPM, ANCHOR_BW_HZ
 def preprocess_bvp(bvp: np.ndarray, fs: int) -> np.ndarray:
     bvp = signal.detrend(bvp, type='linear')
     # Light median filter to suppress outliers/spikes
-    k = max(3, int(max(3, int(0.05 * fs)) ) | 1)  # odd kernel
+    k = max(3, int(max(3, int(0.03 * fs)) ) | 1)  # odd kernel, slightly shorter
     try:
         bvp = signal.medfilt(bvp, kernel_size=k)
     except Exception:
         pass
     # Use a slightly narrower passband around typical HR to improve SNR
-    low, high = 0.9, 2.5
+    low, high = 0.7, 3.0
     b, a = signal.butter(3, [low / (fs / 2), high / (fs / 2)], btype='band')
     bvp_filtered = signal.filtfilt(b, a, bvp)
     # Slightly stronger smoothing after band-pass (cap to avoid over-smoothing)
-    window_size = int(min(fs * 0.15, 11))
+    window_size = int(min(fs * 0.08, 7))
     if window_size > 1:
         kernel = np.ones(window_size) / window_size
         return np.convolve(bvp_filtered, kernel, mode='same')
@@ -46,7 +46,7 @@ def preprocess_bvp_anchored(bvp: np.ndarray, fs: int, hr_bpm: float) -> np.ndarr
     b, a = signal.butter(3, [low / (fs / 2), high / (fs / 2)], btype='band')
     bvp_filtered = signal.filtfilt(b, a, bvp)
     # light smoothing
-    window_size = int(min(fs * 0.10, 9))
+    window_size = int(min(fs * 0.08, 7))
     if window_size > 1:
         kernel = np.ones(window_size) / window_size
         return np.convolve(bvp_filtered, kernel, mode='same')
@@ -282,23 +282,26 @@ def hrv_metrics(bvp: np.ndarray, fs: int) -> dict:
 
 
 def snr_db(bvp: np.ndarray, hr_bpm: float, fs: int) -> float:
-    """Welch-based SNR using HR and its harmonic vs rest of physio band."""
-    hr_freq = hr_bpm / 60.0
-    deviation = 6 / 60.0
-    # Welch smoother spectrum than periodogram
-    nperseg = min(len(bvp), max(fs * 8, 256))
-    if nperseg < 32:
-        nperseg = 32
-    f, pxx = signal.welch(bvp, fs, nperseg=nperseg)
-    hr_band = (f >= (hr_freq - deviation)) & (f <= (hr_freq + deviation))
-    harmonic_band = (f >= (2 * hr_freq - deviation)) & (f <= (2 * hr_freq + deviation))
-    signal_power = float(np.sum(pxx[hr_band]) + np.sum(pxx[harmonic_band]))
-    phys_band = (f >= 0.75) & (f <= 3.0)
-    noise_band = phys_band & ~hr_band & ~harmonic_band
-    noise_power = float(np.sum(pxx[noise_band]))
-    if noise_power <= 0 or not np.isfinite(noise_power):
+    """SNR close to de Haan's PPR: signal = power in ±0.08 Hz around f0 and 2*f0,
+    noise = power in 0.6–4.0 Hz excluding those bands. Welch with Hamming window."""
+    if not np.isfinite(hr_bpm) or hr_bpm <= 0:
         return 0.0
-    return float(10.0 * np.log10(max(signal_power, 1e-12) / noise_power))
+    b = signal.detrend(bvp)
+    nperseg = min(len(b), max(256, 8 * fs))
+    if nperseg < 64:
+        nperseg = 64
+    f, pxx = signal.welch(b, fs, window='hamming', nperseg=nperseg, noverlap=nperseg//2, detrend=False)
+    hr_hz = float(hr_bpm) / 60.0
+    bw = 0.08
+    # bands
+    phys = (f >= 0.6) & (f <= 4.0)
+    b0 = (f >= max(0.0, hr_hz - bw)) & (f <= hr_hz + bw)
+    b2 = (f >= max(0.0, 2 * hr_hz - bw)) & (f <= 2 * hr_hz + bw)
+    sig = float(np.sum(pxx[b0]) + np.sum(pxx[b2]))
+    noise = float(np.sum(pxx[phys & ~b0 & ~b2]))
+    if noise <= 0 or not np.isfinite(noise):
+        return 0.0
+    return float(10.0 * np.log10(max(sig, 1e-12) / noise))
 
 
 def quality_score(bvp: np.ndarray) -> float:

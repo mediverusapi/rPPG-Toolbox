@@ -41,7 +41,7 @@ export default function LivePanel({ connected, connect, disconnect, sendFrame, m
   }, [sendFrame])
 
   return (
-    <div className="space-y-3">
+    <div className="space-y-4">
       <div className="flex items-center gap-2">
         {!connected ? (
           <button onClick={connect} className="bg-emerald-600 text-white px-3 py-1.5 rounded">Connect</button>
@@ -50,28 +50,28 @@ export default function LivePanel({ connected, connect, disconnect, sendFrame, m
         )}
         <span className={`text-sm ${connected ? 'text-emerald-700' : 'text-gray-500'}`}>{connected ? 'Connected' : 'Disconnected'}</span>
       </div>
-      <div className="grid md:grid-cols-2 gap-4">
-        <div>
-          <div className="text-sm font-medium mb-1">Camera</div>
-          <video ref={videoRef} autoPlay playsInline muted className="w-full rounded border bg-black" />
-          <canvas ref={canvasRef} className="hidden" />
+      <div>
+        <div className="text-sm font-medium mb-2">Camera</div>
+        <video ref={videoRef} autoPlay playsInline muted className="w-full rounded border bg-black max-w-xl" />
+        <canvas ref={canvasRef} className="hidden" />
+      </div>
+
+      <div>
+        <div className="text-sm font-medium mb-2">Live Waveform (last ~20s)</div>
+        <div className="h-56 rounded border bg-white p-2">
+          <svg viewBox="0 0 500 200" className="w-full h-full">
+            <polyline fill="none" stroke="#10b981" strokeWidth="2"
+              points={waveform.map((y, i) => `${i},${100 - (y * 70)}`).join(' ')} />
+          </svg>
         </div>
-        <div>
-          <div className="text-sm font-medium mb-1">Live Waveform</div>
-          <div className="h-40 rounded border bg-white p-2">
-            <svg viewBox="0 0 300 120" className="w-full h-full">
-              <polyline fill="none" stroke="#10b981" strokeWidth="2"
-                points={waveform.map((y, i) => `${i},${60 - (y * 40)}`).join(' ')} />
-            </svg>
+        {metrics && (
+          <div className="mt-2 text-sm grid grid-cols-2 md:grid-cols-4 gap-2">
+            <div>FFT HR: <b>{metrics.heart_rate?.fft_bpm}</b> bpm</div>
+            <div>Peak HR: <b>{metrics.heart_rate?.peak_bpm}</b> bpm</div>
+            <div>SNR: <b>{metrics.signal_quality?.snr_db}</b> dB</div>
+            <div>Method: <b>{metrics.signal_quality?.method}</b></div>
           </div>
-          {metrics && (
-            <div className="mt-2 text-sm grid grid-cols-2 gap-2">
-              <div>FFT HR: <b>{metrics.heart_rate?.fft_bpm}</b> bpm</div>
-              <div>Peak HR: <b>{metrics.heart_rate?.peak_bpm}</b> bpm</div>
-              <div>SNR: <b>{metrics.signal_quality?.snr_db}</b> dB</div>
-            </div>
-          )}
-        </div>
+        )}
       </div>
     </div>
   )
