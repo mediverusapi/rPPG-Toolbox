@@ -7,7 +7,7 @@ from typing import List, Tuple, Optional
 import cv2
 import numpy as np
 
-from ..config import FPS, ENH_OUT_DIR, FACE_CROP_ENABLED, HAAR_CASCADE_PATH, FALLBACK_HAAR_PATH, FOREHEAD_ONLY
+from ..config import FPS, ENH_OUT_DIR, FACE_CROP_ENABLED, HAAR_CASCADE_PATH, FALLBACK_HAAR_PATH, FOREHEAD_ONLY, FACE_BOX_SCALE
 from .enhancement import maybe_enhance_frame
 
 
@@ -70,7 +70,8 @@ def video_to_frames(file_bytes: bytes) -> Tuple[List[np.ndarray], float, bool, b
                 faces = face_detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
                 if len(faces) > 0:
                     x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
-                    side = int(max(w, h) * 1.5)
+                    # Zoom in slightly by using a smaller scale than before
+                    side = int(max(w, h) * max(0.8, min(2.0, FACE_BOX_SCALE)))
                     cx, cy = x + w // 2, y + h // 2
                     x0 = max(0, cx - side // 2)
                     y0 = max(0, cy - side // 2)

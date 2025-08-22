@@ -36,6 +36,9 @@ FOREHEAD_ONLY = _get_bool_env("FOREHEAD_ONLY", False)
 # Optional green-channel emphasis (1.0 = off)
 GREEN_EMPHASIS = _get_float_env("GREEN_EMPHASIS", 1.08)
 
+# Face box scale (1.0 = detected box, >1 zooms out, <1 zooms in)
+FACE_BOX_SCALE = _get_float_env("FACE_BOX_SCALE", 0.85)
+
 
 # Paths
 ROOT_DIR = os.path.dirname(os.path.dirname(__file__))
