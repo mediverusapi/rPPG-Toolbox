@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .config import TORCH_AVAILABLE, POS_AVAILABLE
 from .routes.predict import router as predict_router
 from .routes.preview import router as preview_router
+from .routes.live import router as live_router
 
 
 def create_app() -> FastAPI:
@@ -40,6 +41,7 @@ def create_app() -> FastAPI:
 
     app.include_router(predict_router)
     app.include_router(preview_router)
+    app.include_router(live_router)
 
     return app
 
