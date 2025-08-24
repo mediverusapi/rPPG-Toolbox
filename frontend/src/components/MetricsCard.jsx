@@ -15,7 +15,7 @@ export default function MetricsCard({ data }) {
   const hrv = data.heart_rate_variability || {}
   const stress = data.stress_and_relaxation || {}
   const qual = data.signal_quality || {}
-  const pm = data.per_method || {}
+  // Removed per-method comparison from UI
 
   return (
     <div className="bg-white border rounded p-4 space-y-3">
@@ -48,20 +48,7 @@ export default function MetricsCard({ data }) {
         </div>
       </div>
 
-      {Object.keys(pm).length > 0 && (
-        <div>
-          <div className="font-medium mb-2">Per-method comparison</div>
-          <div className="grid md:grid-cols-3 gap-3">
-            {Object.entries(pm).map(([name, v]) => (
-              <div key={name} className="border rounded p-3 text-sm bg-gray-50">
-                <div className="font-semibold mb-1">{name}</div>
-                <Row label="SNR" value={v.snr_db} unit="dB" />
-                <Row label="FFT HR" value={v.fft_bpm} unit="bpm" />
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
+      {/* per-method section intentionally removed */}
     </div>
   )
 }
